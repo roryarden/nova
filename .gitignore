@@ -1,0 +1,6 @@
+# Files
+.env
+
+# Directories
+**/__pycache__/
+bot-env/
