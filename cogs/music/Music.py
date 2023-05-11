@@ -1,72 +1,87 @@
 import asyncio
 import discord
-import discord.utils
-import functools
 import requests
 import os
+import wavelink
 from discord.ext import commands
+from wavelink.ext import spotify
 from youtube_dl import YoutubeDL
 
 class Music(commands.Cog):
 
     FFMPEG_EXEC = os.getenv('FFMPEG_EXEC')
 
-    def __init__(self, bot):
+    def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.voice_client = None
-        self.queue = []
 
     @commands.command()
-    async def connect(self, ctx):
-        return self.join(ctx)
-
-    @commands.command()
-    async def join(self, ctx):
+    async def connect(self, ctx: commands.Context):
         channel = ctx.author.voice.channel
         if not channel:
-            await ctx.send('You must be in a voice channel to play content!')
-            return
+            return await ctx.send('You must be in a voice channel to play content!')
 
-        self.voice_client = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
-        if self.voice_client and self.voice_client.is_connected():
-            await self.voice_client.move_to(channel)
+        player: wavelink.Player = ctx.voice_client
+        if player:
+            return await player.move_to(channel)
 
-        else:
-            self.voice_client = await channel.connect()
+        return await channel.connect(cls=wavelink.Player())
 
     @commands.command()
-    async def disconnect(self, ctx):
-        if not ctx.voice_client:
-            await ctx.send("I'm not already in a voice channel!")
-            return
-
-        await ctx.voice_client.disconnect()
-        await ctx.voice_client.cleanup()
-        self.voice_client = None
+    async def join(self, ctx: commands.Context):
+        return await self.connect(ctx)
 
     @commands.command()
-    async def leave(self, ctx):
-        await self.disconnect(ctx)
+    async def disconnect(self, ctx: commands.Context):
+        player: wavelink.Player = ctx.voice_client
+        if not player:
+            return await ctx.send("I'm not already in a voice channel!")
+
+        await player.disconnect()
+        return await player.cleanup()
 
     @commands.command()
-    async def kick(self, ctx):
-        await self.disconnect(ctx)
+    async def leave(self, ctx: commands.Context):
+        player: wavelink.Player = ctx.voice_client
+        return await player.disconnect()
 
     @commands.command()
-    async def pause(self, ctx):
-        if ctx.voice_client.is_playing():
-            ctx.voice_client.pause()
-
-        else:
-            ctx.voice_client.resume()
+    async def kick(self, ctx: commands.Context):
+        player: wavelink.Player = ctx.voice_client
+        return await player.disconnect()
 
     @commands.command()
-    async def resume(self, ctx):
-        if ctx.voice_client.is_playing():
-            await ctx.send('Content is already playing!')
+    async def pause(self, ctx: commands.Context):
+        player: wavelink.Player = ctx.voice_client
+        if not player.current:
+            return await ctx.send("There's nothing to pause!")
+        
+        if player.is_paused():
+            await ctx.send(f'Now resuming {player.current.title}.')
+            return await player.resume()
 
-        else:
-            ctx.voice_client.resume()
+        await ctx.send(f'Now pausing {player.current.title}.')
+        return await player.pause()
+
+    @commands.command()
+    async def resume(self, ctx: commands.Context):
+        player: wavelink.Player = ctx.voice_client
+        if not player.current:
+            return await ctx.send("There's nothing to resume!")
+        
+        if player.is_paused():
+            await ctx.send(f'Now resuming {player.current.title}.')
+            return await player.resume()
+
+        return await ctx.send('Content is already playing!')
+
+    @commands.command()
+    async def skip(self, ctx: commands.Context):
+        player: wavelink.Player = ctx.voice_client
+        if player.queue.is_empty and not player.is_playing():
+            return await ctx.send("There's nothing to skip!")
+
+        await ctx.send(f'Skipping {player.current.title}.')
+        return await player.stop()
 
     #Get videos from links or from youtube search
     def search(self, query):
@@ -83,36 +98,83 @@ class Music(commands.Cog):
         return (info, info['formats'][0]['url'])
 
     @commands.command()
-    async def play(self, ctx, *, query):
-        video, source = self.search(query)
-        self.queue.append((video, source))
-        await ctx.send(f'{video["title"]} is now queued.')
-        await self.join(ctx)
-        if not ctx.voice_client.is_playing():
-            self.bot.dispatch('track_end', ctx)
+    async def play(self, ctx: commands.Context, *, query: str):
+        decoded = spotify.decode_url(query)
+        if decoded:
+            match decoded['type']:
+                case spotify.SpotifySearchType.unusable:
+                    return await ctx.send('That Spotify URL is invalid!')
+                case _:
+                    try:
+                        result = await spotify.SpotifyTrack.search(query=decoded['id'], type=decoded['type'])
+                        tracks = result if isinstance(result, list) else [result]
 
-    @commands.command()
-    async def skip(self, ctx):
-        await ctx.voice_client.stop()
+                    except spotify.SpotifyRequestError as error:
+                        print(error)
+                        return await ctx.send('Oops, critical error occurred. Harrass <@406869765127143439> to fix it!')
 
-    async def check_play(self, ctx: commands.Context):
-        client = ctx.voice_client
-        while client and client.is_playing():
-            await asyncio.sleep(1)
-        
-        self.bot.dispatch("track_end", ctx)
+        else:
+            try:
+                tracks = [await wavelink.YouTubeTrack.search(query, return_first=True)]
 
-    @commands.Cog.listener()
-    async def on_track_end(self, ctx: commands.Context):
-        if not self.queue:
-            await ctx.send('Queue is now empty.')
+            except wavelink.NoTracksError as error:
+                return await ctx.send('Search did not return any results.')
+
+        print(tracks)
+
+        if not tracks:
+            return await ctx.send('Search did not return any results.')
+
+        await asyncio.wait_for(self.connect(ctx), timeout=5)
+        player: wavelink.Player = ctx.voice_client
+        if player.is_playing():
+            for track in tracks:
+                await ctx.send(f'{track.title} is now queued.')
+                await player.queue.put_wait(track)
+
             return
 
-        video, source = self.queue.pop(0)
-        await ctx.send(f'Now playing {video["title"]}.')
         
-        FFMPEG_OPTS = {'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5', 'options': '-vn'}
-        ctx.voice_client.play(discord.FFmpegPCMAudio(source, executable=self.FFMPEG_EXEC, **FFMPEG_OPTS), after=functools.partial(lambda x: self.bot.loop.create_task(self.check_play(ctx))))
+        if not decoded:
+            await self.display_youtube_link(ctx, tracks[0])
+
+        await ctx.send(f'Now playing {tracks[0].title}.')
+        await player.play(tracks[0], populate=True)
+
+        if len(tracks) > 1:
+            player.queue.extend(tracks[1:])
+
+        player.autoplay = True
+
+    @commands.command()
+    async def queue(self, ctx: commands.Context):
+        player: wavelink.Player = ctx.voice_client
+        for i, track in enumerate(player.queue):
+            await ctx.send(f'{i}. {track.title}')
+
+
+    @commands.Cog.listener()
+    async def on_wavelink_track_end(self, payload: wavelink.TrackEventPayload):
+        print('Wavelink track ended')
+        player = payload.player
+        if player.queue.is_empty:
+            track = await player.auto_queue.get_wait()
+            return await player.play(track)
+ 
+        track = await player.queue.get_wait()
+        return await player.play(track)
+
+    async def display_youtube_link(self, ctx: commands.Context, track: wavelink.GenericTrack):
+        embed = discord.Embed(
+            title=track.title,
+            url=track.uri,
+        )
+        #embed.description = track.length
+        video_id = track.uri.split('watch?v=')[1]
+        thumbnail = f'https://img.youtube.com/vi/{video_id}/0.jpg'
+        embed.set_thumbnail(url=thumbnail)
+        embed.set_author(name=track.author)
+        return await ctx.send(embed=embed)
 
 async def setup(bot):
     await bot.add_cog(Music(bot))
